@@ -1,0 +1,421 @@
+name: Build MayNFC
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create files
+        run: |
+          cat > MayNFC.swift <<'MAYEOF'
+          import SwiftUI
+          import CoreNFC
+
+          extension Data {
+              var hex: String { map { String(format: "%02X", $0) }.joined(separator: ":") }
+          }
+
+          let ruStrings: [String: String] = [
+              "Language": "Язык", "Read": "Чтение", "Scan tag": "Сканировать метку", "Write": "Запись",
+              "Type": "Тип", "Text": "Текст", "Write to tag": "Записать на метку", "History": "История",
+              "Copy": "Копировать", "Clear history": "Очистить историю", "Value": "Значение",
+              "Hold the top of your iPhone near the tag.": "Поднеси верх iPhone к метке.",
+              "Hold your iPhone near a writable tag.": "Поднеси iPhone к метке, на которую можно писать.",
+              "Done": "Готово", "Written": "Записано", "Tag is not writable": "На метку нельзя писать",
+              "Message is too big for this tag": "Сообщение не помещается на метку",
+              "Invalid URL": "Неверная ссылка", "Nothing to write": "Нечего записывать",
+              "NFC is not available on this device.": "NFC недоступен на этом устройстве."
+          ]
+
+          struct Entry: Identifiable {
+              let id = UUID()
+              let date: Date
+              let text: String
+          }
+
+          final class NFCViewModel: NSObject, ObservableObject, NFCTagReaderSessionDelegate, NFCNDEFReaderSessionDelegate {
+              @Published var entries: [Entry] = []
+              @Published var status: String = ""
+
+              private var tagSession: NFCTagReaderSession?
+              private var ndefSession: NFCNDEFReaderSession?
+              private var pendingMessage: NFCNDEFMessage?
+
+              func tr(_ s: String) -> String {
+                  UserDefaults.standard.string(forKey: "lang") == "ru" ? (ruStrings[s] ?? s) : s
+              }
+
+              func setStatus(_ s: String) {
+                  DispatchQueue.main.async { self.status = s }
+              }
+
+              func add(_ text: String) {
+                  DispatchQueue.main.async { self.entries.insert(Entry(date: Date(), text: text), at: 0) }
+              }
+
+              func clear() { entries.removeAll() }
+
+              // MARK: Scan
+
+              func scan() {
+                  guard NFCTagReaderSession.readingAvailable else {
+                      setStatus(tr("NFC is not available on this device."))
+                      return
+                  }
+                  status = ""
+                  let session = NFCTagReaderSession(pollingOption: [.iso14443, .iso15693, .iso18092], delegate: self, queue: nil)
+                  session?.alertMessage = tr("Hold the top of your iPhone near the tag.")
+                  session?.begin()
+                  tagSession = session
+              }
+
+              func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {}
+
+              func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
+                  let code = (error as NSError).code
+                  if code == NFCReaderError.readerSessionInvalidationErrorUserCanceled.rawValue { return }
+                  setStatus(error.localizedDescription)
+              }
+
+              func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
+                  guard let tag = tags.first else { return }
+                  session.connect(to: tag) { error in
+                      if let error = error {
+                          session.invalidate(errorMessage: error.localizedDescription)
+                          return
+                      }
+                      var info: [String] = []
+                      var ndefTag: NFCNDEFTag? = nil
+                      switch tag {
+                      case .miFare(let t):
+                          info.append("Type: MIFARE (" + self.familyName(t.mifareFamily) + ")")
+                          info.append("UID: " + t.identifier.hex)
+                          if let h = t.historicalBytes { info.append("Historical bytes: " + h.hex) }
+                          ndefTag = t
+                      case .iso7816(let t):
+                          info.append("Type: ISO 7816 (smart card)")
+                          info.append("UID: " + t.identifier.hex)
+                          info.append("AID: " + t.initialSelectedAID)
+                          if let h = t.historicalBytes { info.append("Historical bytes: " + h.hex) }
+                          ndefTag = t
+                      case .iso15693(let t):
+                          info.append("Type: ISO 15693")
+                          info.append("UID: " + t.identifier.hex)
+                          info.append("IC manufacturer code: " + String(t.icManufacturerCode))
+                          info.append("IC serial number: " + t.icSerialNumber.hex)
+                          ndefTag = t
+                      case .feliCa(let t):
+                          info.append("Type: FeliCa")
+                          info.append("IDm: " + t.currentIDm.hex)
+                          info.append("System code: " + t.currentSystemCode.hex)
+                          ndefTag = t
+                      @unknown default:
+                          session.invalidate(errorMessage: "Unsupported tag")
+                          return
+                      }
+                      guard let nt = ndefTag else {
+                          self.finish(session, info)
+                          return
+                      }
+                      nt.queryNDEFStatus { status, capacity, _ in
+                          if status == .notSupported {
+                              info.append("NDEF: not supported")
+                              self.finish(session, info)
+                              return
+                          }
+                          info.append("NDEF capacity: " + String(capacity) + " bytes" + (status == .readOnly ? " (read-only)" : ""))
+                          nt.readNDEF { message, _ in
+                              if let message = message, !message.records.isEmpty {
+                                  for (i, r) in message.records.enumerated() {
+                                      info.append("Record " + String(i + 1) + ": " + self.describe(r))
+                                  }
+                              } else {
+                                  info.append("NDEF: empty")
+                              }
+                              self.finish(session, info)
+                          }
+                      }
+                  }
+              }
+
+              private func finish(_ session: NFCTagReaderSession, _ info: [String]) {
+                  add(info.joined(separator: "\n"))
+                  session.alertMessage = tr("Done")
+                  session.invalidate()
+              }
+
+              private func familyName(_ f: NFCMiFareFamily) -> String {
+                  switch f {
+                  case .ultralight: return "Ultralight / NTAG"
+                  case .plus: return "Plus"
+                  case .desfire: return "DESFire"
+                  default: return "Unknown"
+                  }
+              }
+
+              private func describe(_ r: NFCNDEFPayload) -> String {
+                  switch r.typeNameFormat {
+                  case .nfcWellKnown:
+                      if let url = r.wellKnownTypeURIPayload() { return "URL " + url.absoluteString }
+                      let (text, _) = r.wellKnownTypeTextPayload()
+                      if let text = text { return "Text \"" + text + "\"" }
+                  case .media:
+                      let mime = String(data: r.type, encoding: .utf8) ?? "?"
+                      return "Media " + mime + " (" + String(r.payload.count) + " bytes)"
+                  default:
+                      break
+                  }
+                  return String(r.payload.count) + " bytes: " + r.payload.prefix(32).map { String(format: "%02X", $0) }.joined()
+              }
+
+              // MARK: Write
+
+              func write(kind: Int, value: String) {
+                  guard NFCNDEFReaderSession.readingAvailable else {
+                      setStatus(tr("NFC is not available on this device."))
+                      return
+                  }
+                  let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if trimmed.isEmpty { setStatus(tr("Nothing to write")); return }
+                  var payload: NFCNDEFPayload? = nil
+                  if kind == 1 {
+                      if let url = URL(string: trimmed) { payload = NFCNDEFPayload.wellKnownTypePayload(url: url) }
+                      if payload == nil { setStatus(tr("Invalid URL")); return }
+                  } else {
+                      payload = NFCNDEFPayload.wellKnownTypePayload(string: trimmed, locale: Locale(identifier: "en"))
+                  }
+                  guard let p = payload else { setStatus(tr("Nothing to write")); return }
+                  pendingMessage = NFCNDEFMessage(records: [p])
+                  status = ""
+                  let session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
+                  session.alertMessage = tr("Hold your iPhone near a writable tag.")
+                  session.begin()
+                  ndefSession = session
+              }
+
+              func readerSession(_ session: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
+                  let code = (error as NSError).code
+                  if code == NFCReaderError.readerSessionInvalidationErrorUserCanceled.rawValue { return }
+                  setStatus(error.localizedDescription)
+              }
+
+              func readerSession(_ session: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) {}
+
+              func readerSession(_ session: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
+                  guard let tag = tags.first, let message = pendingMessage else { return }
+                  session.connect(to: tag) { error in
+                      if let error = error {
+                          session.invalidate(errorMessage: error.localizedDescription)
+                          return
+                      }
+                      tag.queryNDEFStatus { status, capacity, _ in
+                          if status != .readWrite {
+                              session.invalidate(errorMessage: self.tr("Tag is not writable"))
+                              return
+                          }
+                          if message.length > capacity {
+                              session.invalidate(errorMessage: self.tr("Message is too big for this tag"))
+                              return
+                          }
+                          tag.writeNDEF(message) { error in
+                              if let error = error {
+                                  session.invalidate(errorMessage: error.localizedDescription)
+                              } else {
+                                  self.add(self.tr("Written") + ": " + String(message.length) + " bytes")
+                                  session.alertMessage = self.tr("Written")
+                                  session.invalidate()
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct ContentView: View {
+              @StateObject private var vm = NFCViewModel()
+              @AppStorage("lang") private var lang = "en"
+              @State private var kind = 0
+              @State private var value = ""
+
+              private func t(_ s: String) -> String { lang == "ru" ? (ruStrings[s] ?? s) : s }
+
+              var body: some View {
+                  NavigationView {
+                      List {
+                          Section {
+                              Picker(t("Language"), selection: $lang) {
+                                  Text("English").tag("en")
+                                  Text("Русский").tag("ru")
+                              }
+                              .pickerStyle(.segmented)
+                          }
+                          Section(header: Text(t("Read"))) {
+                              Button(t("Scan tag")) { vm.scan() }
+                              if !vm.status.isEmpty {
+                                  Text(vm.status).foregroundColor(.red)
+                              }
+                          }
+                          Section(header: Text(t("Write"))) {
+                              Picker(t("Type"), selection: $kind) {
+                                  Text(t("Text")).tag(0)
+                                  Text("URL").tag(1)
+                              }
+                              .pickerStyle(.segmented)
+                              TextField(t("Value"), text: $value)
+                                  .autocapitalization(.none)
+                                  .disableAutocorrection(true)
+                              Button(t("Write to tag")) { vm.write(kind: kind, value: value) }
+                          }
+                          Section(header: Text(t("History"))) {
+                              ForEach(vm.entries) { e in
+                                  VStack(alignment: .leading, spacing: 4) {
+                                      Text(e.date, style: .time).font(.caption).foregroundColor(.secondary)
+                                      Text(e.text).font(.system(.footnote, design: .monospaced))
+                                  }
+                                  .contextMenu {
+                                      Button(t("Copy")) { UIPasteboard.general.string = e.text }
+                                  }
+                              }
+                              if !vm.entries.isEmpty {
+                                  Button(t("Clear history")) { vm.clear() }
+                              }
+                          }
+                      }
+                      .navigationTitle("MayNFC")
+                  }
+                  .navigationViewStyle(.stack)
+              }
+          }
+
+          @main
+          struct MayNFCApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+          MAYEOF
+          cat > ent.xml <<'MAYEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>application-identifier</key>
+              <string>local.maynfc</string>
+              <key>com.apple.developer.nfc.readersession.formats</key>
+              <array>
+                  <string>NDEF</string>
+                  <string>TAG</string>
+              </array>
+              <key>platform-application</key>
+              <true/>
+          </dict>
+          </plist>
+          MAYEOF
+          cat > mkapp.py <<'MAYEOF'
+          # Builds Info.plist and a simple app icon (stdlib only).
+          import plistlib, zlib, struct, math, os
+          info = {
+              'CFBundleIdentifier': 'local.maynfc', 'CFBundleName': 'MayNFC', 'CFBundleDisplayName': 'MayNFC',
+              'CFBundleExecutable': 'MayNFC', 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': '0.1.0',
+              'CFBundleVersion': '1', 'CFBundleInfoDictionaryVersion': '6.0', 'MinimumOSVersion': '15.0', 'UIDeviceFamily': [1],
+              'UIRequiredDeviceCapabilities': ['arm64'], 'LSRequiresIPhoneOS': True,
+              'NFCReaderUsageDescription': 'MayNFC reads and writes NFC tags.',
+              'UILaunchScreen': {}, 'UIApplicationSceneManifest': {'UIApplicationSupportsMultipleScenes': False},
+              'UISupportedInterfaceOrientations': ['UIInterfaceOrientationPortrait'],
+              'CFBundleIcons': {'CFBundlePrimaryIcon': {'CFBundleIconFiles': ['AppIcon60x60']}},
+              'com.apple.developer.nfc.readersession.felica.systemcodes': ['8005', '8008', '0003', '12FC', 'FE00'],
+              'com.apple.developer.nfc.readersession.iso7816.select-identifiers': [
+                  'D2760000850101', 'A0000000031010', 'A0000000041010', 'A00000002501', 'A0000000043060', 'A0000000032010', 'A00000000386980701'],
+          }
+          os.makedirs('MayNFC.app', exist_ok=True)
+          plistlib.dump(info, open('MayNFC.app/Info.plist', 'wb'))
+
+          def png(size):
+              rows = []
+              c = size / 2.0
+              for y in range(size):
+                  row = bytearray([0])
+                  for x in range(size):
+                      d = math.hypot(x - c + 0.5, y - c + 0.5) / c
+                      t = y / size
+                      r, g, b = int(20 + 20 * t), int(90 + 80 * (1 - t)), int(220 - 40 * t)
+                      for rad in (0.30, 0.50, 0.70):
+                          if abs(d - rad) < 0.045 and (x - c) > -0.2 * c:
+                              r, g, b = 255, 255, 255
+                      if d < 0.10:
+                          r, g, b = 255, 255, 255
+                      row += bytes((r, g, b))
+                  rows.append(bytes(row))
+              raw = b''.join(rows)
+              def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
+          open('MayNFC.app/AppIcon60x60@2x.png', 'wb').write(png(120))
+          open('MayNFC.app/AppIcon60x60@3x.png', 'wb').write(png(180))
+          print('app skeleton ready')
+          MAYEOF
+          cat > control <<'MAYEOF'
+          Package: local.maynfc
+          Name: MayNFC
+          Version: 0.1.0
+          Architecture: iphoneos-arm64e
+          Description: Simple NFC tag reader and writer (Core NFC). Shows UID, tag type and NDEF records, writes text and URL tags.
+          Maintainer: Local Build
+          Author: Local Build
+          Section: Utilities
+          MAYEOF
+          ls -la
+
+      - name: Install tools
+        run: brew install ldid dpkg
+
+      - name: Compile Swift app
+        run: |
+          set -ex
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          build() { xcrun --sdk iphoneos swiftc -parse-as-library -O -sdk "$SDK" -target "$1-apple-ios15.0" -module-name MayNFC -o "bin_$1" MayNFC.swift; }
+          build arm64
+          if build arm64e; then
+            lipo -create bin_arm64 bin_arm64e -output MayNFC
+          else
+            echo "arm64e failed, using arm64 only"
+            cp bin_arm64 MayNFC
+          fi
+          lipo -info MayNFC
+          otool -L MayNFC | head -20
+
+      - name: Assemble app, sign, build ipa and deb
+        run: |
+          set -ex
+          python3 mkapp.py
+          cp MayNFC MayNFC.app/MayNFC
+          chmod 755 MayNFC.app/MayNFC
+          ldid -Sent.xml MayNFC.app/MayNFC
+          mkdir -p out Payload pkg/DEBIAN pkg/Applications
+          cp -R MayNFC.app Payload/
+          zip -qr out/MayNFC.ipa Payload
+          cp -R MayNFC.app pkg/Applications/
+          cp control pkg/DEBIAN/control
+          printf '#!/bin/sh\n(uicache -p /Applications/MayNFC.app || uicache) >/dev/null 2>&1\nexit 0\n' > pkg/DEBIAN/postinst
+          printf '#!/bin/sh\nuicache >/dev/null 2>&1\nexit 0\n' > pkg/DEBIAN/postrm
+          chmod 755 pkg/DEBIAN/postinst pkg/DEBIAN/postrm
+          echo "Installed-Size: $(du -sk pkg/Applications | cut -f1)" >> pkg/DEBIAN/control
+          dpkg-deb --root-owner-group -Zlzma -b pkg out/maynfc_iphoneos-arm64e.deb || dpkg-deb --root-owner-group -Zgzip -b pkg out/maynfc_iphoneos-arm64e.deb
+          dpkg-deb -I out/maynfc_iphoneos-arm64e.deb
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maynfc
+          path: out/*
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: MayNFC build ${{ github.run_number }}
+          files: out/*
