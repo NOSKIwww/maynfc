@@ -184,10 +184,10 @@ jobs:
                   if trimmed.isEmpty { setStatus(tr("Nothing to write")); return }
                   var payload: NFCNDEFPayload? = nil
                   if kind == 1 {
-                      if let url = URL(string: trimmed) { payload = NFCNDEFPayload.wellKnownTypePayload(url: url) }
+                      if let url = URL(string: trimmed) { payload = NFCNDEFPayload.wellKnownTypeURIPayload(url: url) }
                       if payload == nil { setStatus(tr("Invalid URL")); return }
                   } else {
-                      payload = NFCNDEFPayload.wellKnownTypePayload(string: trimmed, locale: Locale(identifier: "en"))
+                      payload = NFCNDEFPayload.wellKnownTypeTextPayload(string: trimmed, locale: Locale(identifier: "en"))
                   }
                   guard let p = payload else { setStatus(tr("Nothing to write")); return }
                   pendingMessage = NFCNDEFMessage(records: [p])
